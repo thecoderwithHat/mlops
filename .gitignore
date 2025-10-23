@@ -208,3 +208,5 @@ __marimo__/
 
 02-experiment-tracking/models
 02-experiment-tracking/mlruns
+03-orchestration/mlartifacts
+03-orchestration/models
