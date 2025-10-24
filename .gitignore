@@ -210,3 +210,4 @@ __marimo__/
 02-experiment-tracking/mlruns
 03-orchestration/mlartifacts
 03-orchestration/models
+04-deployment/web-servies-mlflow/mlartifacts/1/models/m-5d2067e12cb24babb50c2c82da43a7e5/artifacts
