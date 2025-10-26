@@ -69,11 +69,16 @@ jobs:
         env:
           MODEL_TYPE: ${{ inputs.model_type }}
           EXPERIMENT_NAME: ${{ inputs.experiment_name }}
+          DATA_MONTH: ${{ inputs.data_month }}
         run: |
           cd 03-orchestration
-          python duration-prediction.py \
-            --model-type $MODEL_TYPE \
-            --experiment-name $EXPERIMENT_NAME
+          
+          # Parse year and month from YYYY-MM format
+          YEAR=$(echo $DATA_MONTH | cut -d'-' -f1)
+          MONTH=$(echo $DATA_MONTH | cut -d'-' -f2)
+          
+          echo "Training model for year=$YEAR month=$MONTH"
+          python duration-prediction.py --year $YEAR --month $MONTH
       
       - name: Register model in MLflow
         run: |
