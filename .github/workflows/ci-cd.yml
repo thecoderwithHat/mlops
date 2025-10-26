@@ -305,24 +305,24 @@ jobs:
       - name: Validate docker-compose configuration
         run: |
           cd 05-monitoring
-          docker-compose config
+          docker compose config
       
       - name: Test monitoring stack
         run: |
           cd 05-monitoring
-          docker-compose up -d
+          docker compose up -d
           sleep 30
           
           # Check if services are healthy
-          docker-compose ps
+          docker compose ps
           
           # Test PostgreSQL connection
-          docker-compose exec -T db pg_isready -U postgres || echo "PostgreSQL not ready"
+          docker compose exec -T db pg_isready -U postgres || echo "PostgreSQL not ready"
           
           # Test Grafana API
           curl -f http://localhost:3000/api/health || echo "Grafana not ready"
           
-          docker-compose down
+          docker compose down
         continue-on-error: true
 
   # ========================================
