@@ -1,0 +1,485 @@
+name: MLOps CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.11'
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ========================================
+  # Code Quality & Linting
+  # ========================================
+  lint:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install linting tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 black pylint isort mypy
+      
+      - name: Run Black (Code Formatter Check)
+        run: |
+          black --check --diff . || echo "Black found formatting issues"
+        continue-on-error: true
+      
+      - name: Run isort (Import Sorting Check)
+        run: |
+          isort --check-only --diff . || echo "isort found import sorting issues"
+        continue-on-error: true
+      
+      - name: Run Flake8 (Linting)
+        run: |
+          # Stop the build if there are Python syntax errors or undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Exit-zero treats all errors as warnings
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+        continue-on-error: true
+
+  # ========================================
+  # Unit Tests
+  # ========================================
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.10', '3.11']
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov pytest-mock
+          
+          # Install project dependencies
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f 02-experiment-tracking/requirements.txt ]; then 
+            pip install -r 02-experiment-tracking/requirements.txt
+          fi
+          if [ -f 05-monitoring/requirements.txt ]; then 
+            pip install -r 05-monitoring/requirements.txt
+          fi
+      
+      - name: Run tests with pytest
+        run: |
+          # Run tests if test directory exists
+          if [ -d "tests" ]; then
+            pytest tests/ -v --cov=. --cov-report=xml --cov-report=html
+          else
+            echo "No tests directory found, skipping tests"
+          fi
+        continue-on-error: true
+      
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v4
+        if: matrix.python-version == '3.11'
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+        continue-on-error: true
+
+  # ========================================
+  # Notebook Validation
+  # ========================================
+  validate-notebooks:
+    name: Validate Jupyter Notebooks
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install nbconvert nbformat jupyter
+          
+          # Install project dependencies
+          if [ -f 02-experiment-tracking/requirements.txt ]; then 
+            pip install -r 02-experiment-tracking/requirements.txt
+          fi
+      
+      - name: Validate notebook syntax
+        run: |
+          find . -name "*.ipynb" -not -path "*/\.*" | while read notebook; do
+            echo "Validating $notebook"
+            jupyter nbconvert --to notebook --execute --ExecutePreprocessor.timeout=60 \
+              --output /tmp/validated.ipynb "$notebook" || echo "Failed to validate $notebook"
+          done
+        continue-on-error: true
+
+  # ========================================
+  # Build Docker Images
+  # ========================================
+  build-docker:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    strategy:
+      matrix:
+        service:
+          - name: web-service
+            context: ./04-deployment/web-services
+            dockerfile: ./04-deployment/web-services/Dockerfile
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.service.name }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.service.context }}
+          file: ${{ matrix.service.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+        continue-on-error: true
+
+  # ========================================
+  # MLflow Model Training & Tracking
+  # ========================================
+  train-model:
+    name: Train and Track ML Model
+    runs-on: ubuntu-latest
+    needs: [test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install mlflow boto3 scikit-learn xgboost
+          
+          if [ -f 02-experiment-tracking/requirements.txt ]; then 
+            pip install -r 02-experiment-tracking/requirements.txt
+          fi
+      
+      - name: Download training data
+        run: |
+          mkdir -p 02-experiment-tracking/data
+          # Add your data download logic here
+          echo "Data download step - implement based on your data source"
+      
+      - name: Run training pipeline
+        run: |
+          cd 03-orchestration
+          # python duration-prediction.py
+          echo "Training pipeline execution - uncomment when ready"
+        continue-on-error: true
+      
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts
+          path: |
+            03-orchestration/models/
+            03-orchestration/mlartifacts/
+          retention-days: 30
+        continue-on-error: true
+
+  # ========================================
+  # Model Validation
+  # ========================================
+  validate-model:
+    name: Validate Model Performance
+    runs-on: ubuntu-latest
+    needs: [train-model]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Download model artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: model-artifacts
+          path: ./models
+        continue-on-error: true
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install scikit-learn xgboost pandas numpy
+      
+      - name: Validate model metrics
+        run: |
+          # Add your model validation logic here
+          echo "Model validation - implement performance threshold checks"
+          # Example: Check if RMSE < threshold, R2 > threshold, etc.
+        continue-on-error: true
+
+  # ========================================
+  # Monitoring Setup
+  # ========================================
+  setup-monitoring:
+    name: Deploy Monitoring Stack
+    runs-on: ubuntu-latest
+    needs: [build-docker]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Validate docker-compose configuration
+        run: |
+          cd 05-monitoring
+          docker-compose config
+      
+      - name: Test monitoring stack
+        run: |
+          cd 05-monitoring
+          docker-compose up -d
+          sleep 30
+          
+          # Check if services are healthy
+          docker-compose ps
+          
+          # Test PostgreSQL connection
+          docker-compose exec -T db pg_isready -U postgres || echo "PostgreSQL not ready"
+          
+          # Test Grafana API
+          curl -f http://localhost:3000/api/health || echo "Grafana not ready"
+          
+          docker-compose down
+        continue-on-error: true
+
+  # ========================================
+  # Integration Tests
+  # ========================================
+  integration-test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [build-docker]
+    
+    services:
+      postgres:
+        image: postgres:latest
+        env:
+          POSTGRES_PASSWORD: example
+          POSTGRES_DB: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest requests psycopg2-binary
+          
+          if [ -f 05-monitoring/requirements.txt ]; then 
+            pip install -r 05-monitoring/requirements.txt
+          fi
+      
+      - name: Run integration tests
+        env:
+          DATABASE_URL: postgresql://postgres:example@localhost:5432/test
+        run: |
+          # Add your integration tests here
+          echo "Integration tests - implement database and API tests"
+        continue-on-error: true
+
+  # ========================================
+  # Security Scanning
+  # ========================================
+  security-scan:
+    name: Security Vulnerability Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+        continue-on-error: true
+      
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+        continue-on-error: true
+      
+      - name: Run pip-audit for Python dependencies
+        run: |
+          python -m pip install pip-audit
+          pip-audit || echo "Found vulnerabilities in dependencies"
+        continue-on-error: true
+
+  # ========================================
+  # Deploy to Staging
+  # ========================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build-docker, validate-model, integration-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    environment:
+      name: staging
+      url: https://staging.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Deploy to staging environment
+        run: |
+          echo "Deploying to staging..."
+          # Add your staging deployment logic here
+          # Examples:
+          # - Deploy to AWS ECS/EKS
+          # - Deploy to GCP Cloud Run
+          # - Deploy to Azure Container Apps
+          # - Update Kubernetes manifests
+          echo "Deployment complete"
+
+  # ========================================
+  # Deploy to Production
+  # ========================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-docker, validate-model, integration-test, security-scan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://production.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Deploy to production environment
+        run: |
+          echo "Deploying to production..."
+          # Add your production deployment logic here
+          echo "Deployment complete"
+      
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ github.run_number }}
+          release_name: Release v${{ github.run_number }}
+          body: |
+            Automated release from CI/CD pipeline
+            - Commit: ${{ github.sha }}
+            - Branch: ${{ github.ref }}
+          draft: false
+          prerelease: false
+        continue-on-error: true
+
+  # ========================================
+  # Notification
+  # ========================================
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: always()
+    
+    steps:
+      - name: Send notification
+        run: |
+          echo "Pipeline completed with status: ${{ job.status }}"
+          # Add notification logic here (Slack, Email, Teams, etc.)

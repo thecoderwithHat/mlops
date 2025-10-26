@@ -1,0 +1,141 @@
+name: Model Training Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_type:
+        description: 'Model type to train'
+        required: true
+        default: 'xgboost'
+        type: choice
+        options:
+          - linear_regression
+          - xgboost
+          - random_forest
+      data_month:
+        description: 'Data month (YYYY-MM)'
+        required: true
+        default: '2021-01'
+      experiment_name:
+        description: 'MLflow experiment name'
+        required: false
+        default: 'duration-prediction'
+
+env:
+  PYTHON_VERSION: '3.11'
+  MLFLOW_TRACKING_URI: 'http://localhost:5000'
+
+jobs:
+  train:
+    name: Train ML Model
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install mlflow boto3 scikit-learn xgboost pandas numpy
+          
+          if [ -f 02-experiment-tracking/requirements.txt ]; then 
+            pip install -r 02-experiment-tracking/requirements.txt
+          fi
+      
+      - name: Download training data
+        run: |
+          mkdir -p 02-experiment-tracking/data
+          cd 02-experiment-tracking/data
+          
+          # Download NYC Taxi data
+          wget https://d37ci6vzurychx.cloudfront.net/trip-data/green_tripdata_${{ inputs.data_month }}.parquet \
+            -O green_tripdata_${{ inputs.data_month }}.parquet || \
+            echo "Data download failed, using existing data"
+      
+      - name: Start MLflow tracking server
+        run: |
+          cd 02-experiment-tracking
+          mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri sqlite:///mlflow.db &
+          sleep 10
+      
+      - name: Train model
+        env:
+          MODEL_TYPE: ${{ inputs.model_type }}
+          EXPERIMENT_NAME: ${{ inputs.experiment_name }}
+        run: |
+          cd 03-orchestration
+          python duration-prediction.py \
+            --model-type $MODEL_TYPE \
+            --experiment-name $EXPERIMENT_NAME
+      
+      - name: Register model in MLflow
+        run: |
+          cd 03-orchestration
+          
+          # Get the best run ID
+          RUN_ID=$(cat run_id.txt)
+          echo "Best run ID: $RUN_ID"
+          
+          # Register model
+          python << EOF
+          import mlflow
+          
+          mlflow.set_tracking_uri("${{ env.MLFLOW_TRACKING_URI }}")
+          
+          model_uri = f"runs:/{RUN_ID}/model"
+          model_name = "${{ inputs.experiment_name }}-${{ inputs.model_type }}"
+          
+          mlflow.register_model(model_uri, model_name)
+          print(f"Model registered: {model_name}")
+          EOF
+      
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-model-${{ inputs.model_type }}-${{ github.run_number }}
+          path: |
+            03-orchestration/models/
+            03-orchestration/mlartifacts/
+            03-orchestration/run_id.txt
+          retention-days: 90
+      
+      - name: Generate model card
+        run: |
+          cat > model_card.md << EOF
+          # Model Card: ${{ inputs.model_type }}
+          
+          ## Model Details
+          - **Model Type**: ${{ inputs.model_type }}
+          - **Training Data**: NYC Taxi ${{ inputs.data_month }}
+          - **Experiment**: ${{ inputs.experiment_name }}
+          - **Training Date**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          - **GitHub Run**: ${{ github.run_number }}
+          - **Commit**: ${{ github.sha }}
+          
+          ## Training Configuration
+          - Python Version: ${{ env.PYTHON_VERSION }}
+          - MLflow Tracking URI: ${{ env.MLFLOW_TRACKING_URI }}
+          
+          ## Model Performance
+          (Metrics to be populated from MLflow)
+          
+          ## Artifacts
+          - Model files available in GitHub Actions artifacts
+          - MLflow run ID: (check run_id.txt)
+          EOF
+          
+          cat model_card.md
+      
+      - name: Upload model card
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-card-${{ inputs.model_type }}-${{ github.run_number }}
+          path: model_card.md
+          retention-days: 365

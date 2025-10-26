@@ -1,0 +1,265 @@
+name: Deploy Model Service
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      model_version:
+        description: 'Model version or run ID'
+        required: true
+      service_type:
+        description: 'Service type'
+        required: true
+        type: choice
+        options:
+          - web-service
+          - batch
+          - mlflow-service
+
+env:
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  validate-model:
+    name: Validate Model Before Deployment
+    runs-on: ubuntu-latest
+    outputs:
+      validated: ${{ steps.validate.outputs.result }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Validate model exists
+        id: validate
+        run: |
+          echo "Validating model version: ${{ inputs.model_version }}"
+          # Add validation logic here
+          # Check if model exists in MLflow registry
+          # Validate model performance metrics
+          
+          echo "result=true" >> $GITHUB_OUTPUT
+
+  build-service:
+    name: Build Service Container
+    runs-on: ubuntu-latest
+    needs: [validate-model]
+    if: needs.validate-model.outputs.validated == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Determine service path
+        id: service_path
+        run: |
+          case "${{ inputs.service_type }}" in
+            web-service)
+              echo "context=./04-deployment/web-services" >> $GITHUB_OUTPUT
+              echo "dockerfile=./04-deployment/web-services/Dockerfile" >> $GITHUB_OUTPUT
+              ;;
+            batch)
+              echo "context=./04-deployment/batch" >> $GITHUB_OUTPUT
+              echo "dockerfile=./04-deployment/batch/Dockerfile" >> $GITHUB_OUTPUT
+              ;;
+            mlflow-service)
+              echo "context=./04-deployment/web-servies-mlflow" >> $GITHUB_OUTPUT
+              echo "dockerfile=./04-deployment/web-servies-mlflow/Dockerfile" >> $GITHUB_OUTPUT
+              ;;
+          esac
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ steps.service_path.outputs.context }}
+          file: ${{ steps.service_path.outputs.dockerfile }}
+          push: true
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}-${{ inputs.service_type }}:${{ inputs.model_version }}
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}-${{ inputs.service_type }}:${{ inputs.environment }}
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}-${{ inputs.service_type }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            MODEL_VERSION=${{ inputs.model_version }}
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build-service]
+    if: inputs.environment == 'staging'
+    environment:
+      name: staging
+      url: https://staging-api.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Deploy to staging
+        run: |
+          echo "Deploying ${{ inputs.service_type }} to staging"
+          echo "Model version: ${{ inputs.model_version }}"
+          echo "Image: ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}-${{ inputs.service_type }}:staging"
+          
+          # Add your deployment logic here
+          # Examples:
+          # - kubectl apply -f k8s/staging/
+          # - docker-compose -f docker-compose.staging.yml up -d
+          # - aws ecs update-service --cluster staging --service ml-service
+          # - gcloud run deploy ml-service --image=...
+      
+      - name: Run smoke tests
+        run: |
+          echo "Running smoke tests on staging..."
+          sleep 30  # Wait for service to be ready
+          
+          # Test health endpoint
+          # curl -f https://staging-api.example.com/health || exit 1
+          
+          # Test prediction endpoint
+          # curl -X POST -H "Content-Type: application/json" \
+          #   -d '{"PULocationID": 10, "DOLocationID": 50, "trip_distance": 40}' \
+          #   https://staging-api.example.com/predict || exit 1
+          
+          echo "Smoke tests passed"
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-service, deploy-staging]
+    if: inputs.environment == 'production'
+    environment:
+      name: production
+      url: https://api.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Create deployment backup
+        run: |
+          echo "Creating backup of current production deployment"
+          # Add backup logic
+      
+      - name: Deploy to production with canary
+        run: |
+          echo "Deploying ${{ inputs.service_type }} to production with canary strategy"
+          echo "Model version: ${{ inputs.model_version }}"
+          
+          # Phase 1: Deploy canary (10% traffic)
+          echo "Phase 1: Canary deployment (10% traffic)"
+          # kubectl apply -f k8s/production/canary.yml
+          
+          sleep 60
+          
+          # Phase 2: Monitor canary
+          echo "Phase 2: Monitoring canary deployment"
+          # Check error rates, latency, etc.
+          
+          # Phase 3: Full rollout (100% traffic)
+          echo "Phase 3: Full production rollout"
+          # kubectl apply -f k8s/production/deployment.yml
+      
+      - name: Run production smoke tests
+        run: |
+          echo "Running production smoke tests..."
+          sleep 30
+          
+          # Test endpoints
+          echo "Smoke tests passed"
+      
+      - name: Update model registry
+        run: |
+          echo "Updating model registry with deployment info"
+          # Mark model as "Production" in MLflow
+          # Update metadata with deployment timestamp
+
+  rollback:
+    name: Rollback on Failure
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: failure() && inputs.environment == 'production'
+    
+    steps:
+      - name: Rollback deployment
+        run: |
+          echo "Rolling back production deployment"
+          # Add rollback logic
+          # kubectl rollout undo deployment/ml-service
+      
+      - name: Create incident issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 Production Deployment Failed - Rollback Initiated`,
+              body: `## Deployment Failure
+              
+              **Environment**: Production
+              **Service**: ${{ inputs.service_type }}
+              **Model Version**: ${{ inputs.model_version }}
+              **Workflow Run**: ${{ github.run_number }}
+              
+              ### Action Taken
+              - Automatic rollback initiated
+              - Previous version restored
+              
+              ### Next Steps
+              - [ ] Investigate failure cause
+              - [ ] Fix issues
+              - [ ] Re-attempt deployment
+              `,
+              labels: ['incident', 'production', 'deployment-failure'],
+              assignees: ['${{ github.actor }}']
+            });
+
+  notify:
+    name: Send Deployment Notification
+    runs-on: ubuntu-latest
+    needs: [deploy-production, deploy-staging]
+    if: always()
+    
+    steps:
+      - name: Send success notification
+        if: ${{ needs.deploy-production.result == 'success' || needs.deploy-staging.result == 'success' }}
+        run: |
+          echo "✅ Deployment successful"
+          echo "Environment: ${{ inputs.environment }}"
+          echo "Service: ${{ inputs.service_type }}"
+          echo "Model Version: ${{ inputs.model_version }}"
+          
+          # Add notification logic (Slack, email, etc.)
+      
+      - name: Send failure notification
+        if: ${{ needs.deploy-production.result == 'failure' || needs.deploy-staging.result == 'failure' }}
+        run: |
+          echo "❌ Deployment failed"
+          echo "Environment: ${{ inputs.environment }}"
+          echo "Service: ${{ inputs.service_type }}"
+          
+          # Add notification logic

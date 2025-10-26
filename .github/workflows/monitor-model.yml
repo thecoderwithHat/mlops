@@ -1,0 +1,231 @@
+name: Monitor ML Model
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      alert_threshold:
+        description: 'Drift alert threshold'
+        required: false
+        default: '0.5'
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  calculate-metrics:
+    name: Calculate Model Metrics
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:latest
+        env:
+          POSTGRES_PASSWORD: example
+          POSTGRES_DB: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r 05-monitoring/requirements.txt
+      
+      - name: Setup database schema
+        env:
+          DATABASE_URL: postgresql://postgres:example@localhost:5432/test
+        run: |
+          pip install psycopg2-binary
+          
+          python << EOF
+          import psycopg2
+          
+          conn = psycopg2.connect("$DATABASE_URL")
+          cur = conn.cursor()
+          
+          # Create metrics table
+          cur.execute("""
+              CREATE TABLE IF NOT EXISTS ml_metrics (
+                  id SERIAL PRIMARY KEY,
+                  timestamp TIMESTAMP NOT NULL,
+                  prediction_drift FLOAT,
+                  num_drifted_columns INT,
+                  share_missing_values FLOAT,
+                  dataset_drift BOOLEAN,
+                  drift_score FLOAT,
+                  model_name VARCHAR(100),
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+              )
+          """)
+          
+          cur.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON ml_metrics(timestamp)")
+          
+          conn.commit()
+          cur.close()
+          conn.close()
+          
+          print("Database schema created successfully")
+          EOF
+      
+      - name: Download production data
+        run: |
+          mkdir -p 05-monitoring/data
+          # Add logic to download production prediction data
+          echo "Download production data for monitoring"
+      
+      - name: Calculate Evidently metrics
+        env:
+          DATABASE_URL: postgresql://postgres:example@localhost:5432/test
+          DRIFT_THRESHOLD: ${{ inputs.alert_threshold || '0.5' }}
+        run: |
+          cd 05-monitoring
+          python evidently_metrics_calculation.py
+      
+      - name: Query metrics from database
+        env:
+          DATABASE_URL: postgresql://postgres:example@localhost:5432/test
+        run: |
+          pip install psycopg2-binary pandas
+          
+          python << EOF
+          import psycopg2
+          import pandas as pd
+          from datetime import datetime, timedelta
+          
+          conn = psycopg2.connect("$DATABASE_URL")
+          
+          # Get latest metrics
+          query = """
+              SELECT 
+                  timestamp,
+                  prediction_drift,
+                  num_drifted_columns,
+                  dataset_drift,
+                  drift_score
+              FROM ml_metrics
+              WHERE timestamp > NOW() - INTERVAL '24 hours'
+              ORDER BY timestamp DESC
+              LIMIT 10
+          """
+          
+          df = pd.read_sql(query, conn)
+          conn.close()
+          
+          print("\n=== Latest Model Metrics (Last 24 hours) ===")
+          print(df.to_string())
+          
+          # Save to file for artifact
+          df.to_csv('monitoring_report.csv', index=False)
+          
+          # Check for alerts
+          if len(df) > 0:
+              latest = df.iloc[0]
+              drift_threshold = float("${{ inputs.alert_threshold || '0.5' }}")
+              
+              if latest['drift_score'] > drift_threshold:
+                  print(f"\n⚠️  ALERT: High drift detected! Score: {latest['drift_score']}")
+                  with open('alert.txt', 'w') as f:
+                      f.write(f"DRIFT_ALERT={latest['drift_score']}")
+          EOF
+      
+      - name: Check for alerts
+        id: check_alerts
+        run: |
+          if [ -f alert.txt ]; then
+            source alert.txt
+            echo "alert=true" >> $GITHUB_OUTPUT
+            echo "drift_score=$DRIFT_ALERT" >> $GITHUB_OUTPUT
+          else
+            echo "alert=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Upload monitoring report
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitoring-report-${{ github.run_number }}
+          path: monitoring_report.csv
+          retention-days: 30
+      
+      - name: Create GitHub Issue on Alert
+        if: steps.check_alerts.outputs.alert == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const driftScore = '${{ steps.check_alerts.outputs.drift_score }}';
+            
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 Model Drift Alert - Score: ${driftScore}`,
+              body: `## Model Drift Detected
+              
+              **Drift Score**: ${driftScore}
+              **Threshold**: ${{ inputs.alert_threshold || '0.5' }}
+              **Timestamp**: ${new Date().toISOString()}
+              **Workflow Run**: ${{ github.run_number }}
+              
+              ### Action Required
+              - Review the monitoring dashboard
+              - Analyze feature distributions
+              - Consider model retraining
+              
+              ### Resources
+              - [Monitoring Report Artifact](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+              - [Grafana Dashboard](http://localhost:3000)
+              `,
+              labels: ['model-monitoring', 'alert', 'drift-detection']
+            });
+  
+  update-dashboard:
+    name: Update Grafana Dashboard
+    runs-on: ubuntu-latest
+    needs: [calculate-metrics]
+    if: always()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Generate dashboard snapshot
+        run: |
+          echo "Dashboard update logic"
+          # Add logic to update or create Grafana snapshots
+          # Could use Grafana API to programmatically update dashboards
+
+  send-report:
+    name: Send Monitoring Report
+    runs-on: ubuntu-latest
+    needs: [calculate-metrics]
+    if: always()
+    
+    steps:
+      - name: Download monitoring report
+        uses: actions/download-artifact@v4
+        with:
+          name: monitoring-report-${{ github.run_number }}
+        continue-on-error: true
+      
+      - name: Send report notification
+        run: |
+          echo "Monitoring report generated"
+          # Add notification logic (email, Slack, etc.)
+          # Example: curl -X POST -H 'Content-type: application/json' \
+          #   --data '{"text":"Model monitoring completed"}' \
+          #   $SLACK_WEBHOOK_URL
