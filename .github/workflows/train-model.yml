@@ -56,9 +56,21 @@ jobs:
           cd 02-experiment-tracking/data
           
           # Download NYC Taxi data
-          wget https://d37ci6vzurychx.cloudfront.net/trip-data/green_tripdata_${{ inputs.data_month }}.parquet \
-            -O green_tripdata_${{ inputs.data_month }}.parquet || \
-            echo "Data download failed, using existing data"
+          echo "Downloading data for ${{ inputs.data_month }}..."
+          wget -q https://d37ci6vzurychx.cloudfront.net/trip-data/green_tripdata_${{ inputs.data_month }}.parquet \
+            -O green_tripdata_${{ inputs.data_month }}.parquet || {
+            echo "⚠️  Data download failed for ${{ inputs.data_month }}"
+            echo "Checking if data already exists..."
+            if [ -f "green_tripdata_${{ inputs.data_month }}.parquet" ]; then
+              echo "✅ Using existing data file"
+            else
+              echo "❌ No data available, workflow will fail"
+              exit 1
+            fi
+          }
+          echo "✅ Data ready: green_tripdata_${{ inputs.data_month }}.parquet"
+          ls -lh green_tripdata_${{ inputs.data_month }}.parquet
+        continue-on-error: false
       
       - name: Setup artifact directories
         run: |
@@ -70,12 +82,33 @@ jobs:
       - name: Start MLflow tracking server
         run: |
           # Start MLflow server with artifact root in current directory
+          echo "Starting MLflow server..."
           mlflow server \
             --host 0.0.0.0 \
             --port 5000 \
             --backend-store-uri sqlite:///mlflow.db \
             --default-artifact-root file://$(pwd)/mlartifacts &
-          sleep 10
+          
+          MLFLOW_PID=$!
+          echo "MLflow PID: $MLFLOW_PID"
+          
+          # Wait for MLflow to be ready
+          echo "Waiting for MLflow server to start..."
+          for i in {1..30}; do
+            if curl -s http://localhost:5000/health > /dev/null 2>&1; then
+              echo "✅ MLflow server is ready!"
+              break
+            fi
+            echo "Attempt $i/30: Waiting..."
+            sleep 2
+          done
+          
+          # Verify it's running
+          if ! curl -s http://localhost:5000/health > /dev/null 2>&1; then
+            echo "❌ MLflow server failed to start"
+            exit 1
+          fi
+          
           echo "MLflow server started with artifact root: file://$(pwd)/mlartifacts"
       
       - name: Train model
@@ -89,13 +122,29 @@ jobs:
           
           # Parse year and month from YYYY-MM format
           YEAR=$(echo $DATA_MONTH | cut -d'-' -f1)
-          MONTH=$(echo $DATA_MONTH | cut -d'-' -f2)
+          MONTH=$(echo $DATA_MONTH | cut -d'-' -f2 | sed 's/^0*//')  # Remove leading zeros
           
-          echo "Training model for year=$YEAR month=$MONTH"
-          echo "MLflow tracking URI: $MLFLOW_TRACKING_URI"
-          echo "Artifact root: $MLFLOW_ARTIFACT_ROOT"
+          echo "================================"
+          echo "Training Configuration:"
+          echo "  Year: $YEAR"
+          echo "  Month: $MONTH"
+          echo "  Model Type: $MODEL_TYPE"
+          echo "  Experiment: $EXPERIMENT_NAME"
+          echo "  MLflow URI: $MLFLOW_TRACKING_URI"
+          echo "  Artifact Root: $MLFLOW_ARTIFACT_ROOT"
+          echo "================================"
           
+          # Run training
           python duration-prediction.py --year $YEAR --month $MONTH
+          
+          # Verify run_id.txt was created
+          if [ ! -f "run_id.txt" ]; then
+            echo "❌ Error: run_id.txt not found after training"
+            exit 1
+          fi
+          
+          echo "✅ Training completed successfully!"
+          echo "Run ID: $(cat run_id.txt)"
       
       - name: Register model in MLflow
         env:
@@ -103,72 +152,119 @@ jobs:
         run: |
           cd 03-orchestration
           
+          # Check if run_id.txt exists
+          if [ ! -f "run_id.txt" ]; then
+            echo "❌ run_id.txt not found, skipping model registration"
+            exit 0
+          fi
+          
           # Get the best run ID
           RUN_ID=$(cat run_id.txt)
           echo "Best run ID: $RUN_ID"
           
           # Register model using Python
-          python << EOF
+          python << 'PYEOF'
 import mlflow
-import os
+import sys
 
-mlflow.set_tracking_uri("$MLFLOW_TRACKING_URI")
+mlflow.set_tracking_uri("http://localhost:5000")
 
 run_id = "$RUN_ID"
 model_uri = f"runs:/{run_id}/models_mlflow"
 model_name = "${{ inputs.experiment_name }}-${{ inputs.model_type }}"
 
+print(f"Registering model...")
+print(f"  Run ID: {run_id}")
+print(f"  Model URI: {model_uri}")
+print(f"  Model Name: {model_name}")
+
 try:
     result = mlflow.register_model(model_uri, model_name)
-    print(f"✅ Model registered: {model_name}")
+    print(f"✅ Model registered successfully!")
+    print(f"   Name: {model_name}")
     print(f"   Version: {result.version}")
     print(f"   Run ID: {run_id}")
 except Exception as e:
     print(f"⚠️  Model registration failed: {e}")
     print(f"   Note: Model was still trained successfully!")
     print(f"   Run ID: {run_id}")
-EOF
+    # Don't fail the workflow, training was successful
+    sys.exit(0)
+PYEOF
+        continue-on-error: true
       
       - name: Upload model artifacts
+        if: always()  # Upload even if registration fails
         uses: actions/upload-artifact@v4
         with:
           name: trained-model-${{ inputs.model_type }}-${{ github.run_number }}
           path: |
             03-orchestration/models/
-            03-orchestration/mlartifacts/
             03-orchestration/run_id.txt
+            mlartifacts/
+            mlflow.db
           retention-days: 90
+        continue-on-error: true
       
       - name: Generate model card
+        if: always()  # Generate even if some steps fail
         run: |
-          cat > model_card.md << EOF
-          # Model Card: ${{ inputs.model_type }}
+          # Get run ID if available
+          RUN_ID="N/A"
+          if [ -f "03-orchestration/run_id.txt" ]; then
+            RUN_ID=$(cat 03-orchestration/run_id.txt)
+          fi
           
-          ## Model Details
-          - **Model Type**: ${{ inputs.model_type }}
-          - **Training Data**: NYC Taxi ${{ inputs.data_month }}
-          - **Experiment**: ${{ inputs.experiment_name }}
-          - **Training Date**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          - **GitHub Run**: ${{ github.run_number }}
-          - **Commit**: ${{ github.sha }}
-          
-          ## Training Configuration
-          - Python Version: ${{ env.PYTHON_VERSION }}
-          - MLflow Tracking URI: ${{ env.MLFLOW_TRACKING_URI }}
-          
-          ## Model Performance
-          (Metrics to be populated from MLflow)
-          
-          ## Artifacts
-          - Model files available in GitHub Actions artifacts
-          - MLflow run ID: (check run_id.txt)
-          EOF
+          cat > model_card.md << 'EOF'
+# Model Card: ${{ inputs.model_type }}
+
+## Model Details
+- **Model Type**: ${{ inputs.model_type }}
+- **Training Data**: NYC Taxi ${{ inputs.data_month }}
+- **Experiment**: ${{ inputs.experiment_name }}
+- **Training Date**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+- **GitHub Run**: ${{ github.run_number }}
+- **Commit**: ${{ github.sha }}
+- **MLflow Run ID**: ${RUN_ID}
+
+## Training Configuration
+- Python Version: ${{ env.PYTHON_VERSION }}
+- MLflow Tracking URI: ${{ env.MLFLOW_TRACKING_URI }}
+- Artifact Root: Local filesystem
+
+## Model Performance
+Check MLflow UI for detailed metrics:
+- RMSE (validation)
+- Training time
+- Model parameters
+
+## Artifacts
+- Model files: Available in GitHub Actions artifacts
+- MLflow artifacts: Check mlartifacts/ directory
+- Preprocessor: models/preprocessor.b
+
+## Usage
+Download the artifacts and load the model:
+\`\`\`python
+import mlflow
+
+model_uri = f"runs:/${RUN_ID}/models_mlflow"
+model = mlflow.xgboost.load_model(model_uri)
+\`\`\`
+
+## Training Workflow
+- Repository: ${{ github.repository }}
+- Workflow: Model Training Pipeline
+- Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+EOF
           
           cat model_card.md
       
       - name: Upload model card
+        if: always()  # Upload even if other steps fail
         uses: actions/upload-artifact@v4
         with:
           name: model-card-${{ inputs.model_type }}-${{ github.run_number }}
           path: model_card.md
           retention-days: 365
+        continue-on-error: true
