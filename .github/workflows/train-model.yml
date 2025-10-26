@@ -60,22 +60,30 @@ jobs:
             -O green_tripdata_${{ inputs.data_month }}.parquet || \
             echo "Data download failed, using existing data"
       
+      - name: Setup artifact directories
+        run: |
+          # Create directories for MLflow artifacts in the working directory
+          mkdir -p mlruns mlartifacts
+          echo "MLFLOW_ARTIFACT_ROOT=$(pwd)/mlartifacts" >> $GITHUB_ENV
+          echo "Artifact root: $(pwd)/mlartifacts"
+      
       - name: Start MLflow tracking server
         run: |
-          cd 02-experiment-tracking
-          mkdir -p mlruns mlartifacts
+          # Start MLflow server with artifact root in current directory
           mlflow server \
             --host 0.0.0.0 \
             --port 5000 \
             --backend-store-uri sqlite:///mlflow.db \
-            --default-artifact-root ./mlartifacts &
+            --default-artifact-root file://$(pwd)/mlartifacts &
           sleep 10
+          echo "MLflow server started with artifact root: file://$(pwd)/mlartifacts"
       
       - name: Train model
         env:
           MODEL_TYPE: ${{ inputs.model_type }}
           EXPERIMENT_NAME: ${{ inputs.experiment_name }}
           DATA_MONTH: ${{ inputs.data_month }}
+          MLFLOW_TRACKING_URI: http://localhost:5000
         run: |
           cd 03-orchestration
           
@@ -84,6 +92,9 @@ jobs:
           MONTH=$(echo $DATA_MONTH | cut -d'-' -f2)
           
           echo "Training model for year=$YEAR month=$MONTH"
+          echo "MLflow tracking URI: $MLFLOW_TRACKING_URI"
+          echo "Artifact root: $MLFLOW_ARTIFACT_ROOT"
+          
           python duration-prediction.py --year $YEAR --month $MONTH
       
       - name: Register model in MLflow
