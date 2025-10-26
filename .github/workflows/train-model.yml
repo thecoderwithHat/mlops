@@ -152,45 +152,17 @@ jobs:
         run: |
           cd 03-orchestration
           
-          # Check if run_id.txt exists
           if [ ! -f "run_id.txt" ]; then
             echo "❌ run_id.txt not found, skipping model registration"
             exit 0
           fi
           
-          # Get the best run ID
           RUN_ID=$(cat run_id.txt)
           echo "Best run ID: $RUN_ID"
           
-          # Register model using Python
-          python << 'PYEOF'
-import mlflow
-import sys
-
-mlflow.set_tracking_uri("http://localhost:5000")
-
-run_id = "$RUN_ID"
-model_uri = f"runs:/{run_id}/models_mlflow"
-model_name = "${{ inputs.experiment_name }}-${{ inputs.model_type }}"
-
-print(f"Registering model...")
-print(f"  Run ID: {run_id}")
-print(f"  Model URI: {model_uri}")
-print(f"  Model Name: {model_name}")
-
-try:
-    result = mlflow.register_model(model_uri, model_name)
-    print(f"✅ Model registered successfully!")
-    print(f"   Name: {model_name}")
-    print(f"   Version: {result.version}")
-    print(f"   Run ID: {run_id}")
-except Exception as e:
-    print(f"⚠️  Model registration failed: {e}")
-    print(f"   Note: Model was still trained successfully!")
-    print(f"   Run ID: {run_id}")
-    # Don't fail the workflow, training was successful
-    sys.exit(0)
-PYEOF
+          export RUN_ID="$RUN_ID"
+          export MODEL_NAME="${{ inputs.experiment_name }}-${{ inputs.model_type }}"
+          python ../.github/scripts/register_model.py
         continue-on-error: true
       
       - name: Upload model artifacts
@@ -209,56 +181,16 @@ PYEOF
       - name: Generate model card
         if: always()  # Generate even if some steps fail
         run: |
-          # Get run ID if available
-          RUN_ID="N/A"
-          if [ -f "03-orchestration/run_id.txt" ]; then
-            RUN_ID=$(cat 03-orchestration/run_id.txt)
-          fi
-          
-          cat > model_card.md << 'EOF'
-# Model Card: ${{ inputs.model_type }}
-
-## Model Details
-- **Model Type**: ${{ inputs.model_type }}
-- **Training Data**: NYC Taxi ${{ inputs.data_month }}
-- **Experiment**: ${{ inputs.experiment_name }}
-- **Training Date**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-- **GitHub Run**: ${{ github.run_number }}
-- **Commit**: ${{ github.sha }}
-- **MLflow Run ID**: ${RUN_ID}
-
-## Training Configuration
-- Python Version: ${{ env.PYTHON_VERSION }}
-- MLflow Tracking URI: ${{ env.MLFLOW_TRACKING_URI }}
-- Artifact Root: Local filesystem
-
-## Model Performance
-Check MLflow UI for detailed metrics:
-- RMSE (validation)
-- Training time
-- Model parameters
-
-## Artifacts
-- Model files: Available in GitHub Actions artifacts
-- MLflow artifacts: Check mlartifacts/ directory
-- Preprocessor: models/preprocessor.b
-
-## Usage
-Download the artifacts and load the model:
-\`\`\`python
-import mlflow
-
-model_uri = f"runs:/${RUN_ID}/models_mlflow"
-model = mlflow.xgboost.load_model(model_uri)
-\`\`\`
-
-## Training Workflow
-- Repository: ${{ github.repository }}
-- Workflow: Model Training Pipeline
-- Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-EOF
-          
-          cat model_card.md
+          bash .github/scripts/generate_model_card.sh \
+            "${{ inputs.model_type }}" \
+            "${{ inputs.data_month }}" \
+            "${{ inputs.experiment_name }}" \
+            "${{ github.run_number }}" \
+            "${{ github.sha }}" \
+            "${{ github.repository }}" \
+            "${{ github.server_url }}" \
+            "${{ github.run_id }}" \
+            "http://localhost:5000"
       
       - name: Upload model card
         if: always()  # Upload even if other steps fail
