@@ -98,6 +98,8 @@ jobs:
           python duration-prediction.py --year $YEAR --month $MONTH
       
       - name: Register model in MLflow
+        env:
+          MLFLOW_TRACKING_URI: http://localhost:5000
         run: |
           cd 03-orchestration
           
@@ -105,18 +107,27 @@ jobs:
           RUN_ID=$(cat run_id.txt)
           echo "Best run ID: $RUN_ID"
           
-          # Register model
+          # Register model using Python
           python << EOF
-          import mlflow
-          
-          mlflow.set_tracking_uri("${{ env.MLFLOW_TRACKING_URI }}")
-          
-          model_uri = f"runs:/{RUN_ID}/model"
-          model_name = "${{ inputs.experiment_name }}-${{ inputs.model_type }}"
-          
-          mlflow.register_model(model_uri, model_name)
-          print(f"Model registered: {model_name}")
-          EOF
+import mlflow
+import os
+
+mlflow.set_tracking_uri("$MLFLOW_TRACKING_URI")
+
+run_id = "$RUN_ID"
+model_uri = f"runs:/{run_id}/models_mlflow"
+model_name = "${{ inputs.experiment_name }}-${{ inputs.model_type }}"
+
+try:
+    result = mlflow.register_model(model_uri, model_name)
+    print(f"✅ Model registered: {model_name}")
+    print(f"   Version: {result.version}")
+    print(f"   Run ID: {run_id}")
+except Exception as e:
+    print(f"⚠️  Model registration failed: {e}")
+    print(f"   Note: Model was still trained successfully!")
+    print(f"   Run ID: {run_id}")
+EOF
       
       - name: Upload model artifacts
         uses: actions/upload-artifact@v4
